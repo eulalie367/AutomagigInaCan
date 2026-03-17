@@ -1,0 +1,14 @@
+{
+  "gemini": {
+    "username": "gemini-agent",
+    "approver": "claude-agent"
+  },
+  "claude": {
+    "username": "claude-agent",
+    "approver": "gemini-agent"
+  },
+  "huggingface": {
+    "username": "huggingface-agent",
+    "approver": "gemini-agent"
+  }
+}
