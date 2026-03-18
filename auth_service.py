@@ -12,10 +12,10 @@ from cryptography.exceptions import InvalidSignature
 
 async def run_auth_service():
     nats_url = os.getenv("NATS_URL", "nats://localhost:4222")
-    jwt_secret = os.getenv("JWT_SECRET", "required_secret_not_set")
+    jwt_secret = os.getenv("JWT_SECRET", "")
 
-    if jwt_secret == "required_secret_not_set":
-        print("Error: JWT_SECRET environment variable is not set.")
+    if not jwt_secret:
+        print("Error: JWT_SECRET environment variable is not set or is empty.")
         return
 
     # --- FIX: Challenge Tracking for Replay Protection ---
@@ -96,17 +96,19 @@ async def run_auth_service():
             print(f"LOG: Auth SUCCESS for device: {device_id}")
             response = {"token": token}
 
-        except (InvalidSignature, Exception) as e:
-            # If invalid, publish {"error": "invalid_signature"} to the same subject
-            print(f"LOG: Auth FAILURE for device: {device_id} - Reason: {str(e)}")
+        except InvalidSignature:
+            print(f"LOG: Auth FAILURE for device: {device_id} - Reason: invalid signature")
             response = {"error": "invalid_signature"}
+        except Exception as e:
+            print(f"LOG: Auth ERROR for device: {device_id} - Reason: {e}")
+            response = {"error": "auth_error"}
 
         # Send response to auth.token.{device_id}
         await nc.publish(f"auth.token.{device_id}", json.dumps(response).encode())
 
     # NATS URL from env var
     try:
-        nc = await nats.connect(nats_url)
+        nc = await nats.connect(nats_url, connect_timeout=10)
         print(f"LOG: Connected to NATS at {nats_url}")
     except Exception as e:
         print(f"LOG: Failed to connect to NATS: {e}")

@@ -1,6 +1,5 @@
 import os
 import json
-import subprocess
 
 def get_unique_features():
     features = {
