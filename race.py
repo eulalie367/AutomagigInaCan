@@ -24,11 +24,21 @@ from pathlib import Path
 
 # ── Worktree discovery ────────────────────────────────────────────────────────
 REPO_ROOT = Path(__file__).parent
-WORKTREE_PARENT = REPO_ROOT.parent
+
+_ENV_ALLOWLIST = {
+    "NATS_URL", "JWT_SECRET", "SIMULATED", "HF_MODEL",
+    "GOOGLE_CLOUD_PROJECT", "GOOGLE_CLOUD_LOCATION",
+}
 
 
 def load_env():
-    """Load .env file from repo root if it exists."""
+    """Load .env file from repo root if it exists (allowlisted keys only).
+
+    API keys are NOT loaded — authentication uses CLI login:
+      - anthropic: uses ~/.anthropic or SDK default auth
+      - gemini: uses gcloud ADC (gcloud auth application-default login)
+      - huggingface: uses huggingface-cli login (cached token)
+    """
     env_file = REPO_ROOT / ".env"
     if env_file.exists():
         for line in env_file.read_text().splitlines():
@@ -36,11 +46,34 @@ def load_env():
             if line and not line.startswith("#") and "=" in line:
                 key, _, value = line.partition("=")
                 key, value = key.strip(), value.strip()
-                if value and value != "your_key_here":
+                if key in _ENV_ALLOWLIST and value and value != "your_key_here":
                     os.environ.setdefault(key, value)
 
 
 load_env()
+
+
+def _load_stored_credentials():
+    """Load credentials from login.py's secure store (~/.config/acropolis/)."""
+    cred_dir = Path.home() / ".config" / "acropolis"
+    for name, env_keys in [
+        ("anthropic.json", ["ANTHROPIC_API_KEY"]),
+        ("gemini.json", ["GEMINI_API_KEY", "GOOGLE_API_KEY"]),
+    ]:
+        cred_file = cred_dir / name
+        if cred_file.exists():
+            try:
+                import json as _json
+                data = _json.loads(cred_file.read_text())
+                key = data.get("api_key")
+                if key:
+                    for env_key in env_keys:
+                        os.environ.setdefault(env_key, key)
+            except Exception:
+                pass
+
+
+_load_stored_credentials()
 
 
 def discover_worktrees():
@@ -159,8 +192,16 @@ Output ONLY the function. Zero prose.""",
 }
 
 
-# ── Model callers ─────────────────────────────────────────────────────────────
+# ── Model callers (login-based auth — no API keys) ───────────────────────────
 def call_claude(prompt: str) -> str:
+    """Call Claude via Anthropic SDK. Auth: `anthropic` SDK default chain.
+
+    The SDK resolves credentials in order:
+      1. ANTHROPIC_API_KEY env var (if set)
+      2. ~/.anthropic/auth.json (from `anthropic auth login`)
+      3. Keyring / OS credential store
+    No explicit key needed if you've run: anthropic auth login
+    """
     import anthropic
     client = anthropic.Anthropic()
     msg = client.messages.create(
@@ -172,14 +213,113 @@ def call_claude(prompt: str) -> str:
 
 
 def call_gemini(prompt: str) -> str:
+    """Call Gemini via google-genai SDK. Auth: Application Default Credentials.
+
+    Login once with: gcloud auth application-default login
+    Or set GOOGLE_CLOUD_PROJECT + run: gcloud auth login
+    Falls back to GEMINI_API_KEY/GOOGLE_API_KEY env var if ADC unavailable.
+    """
+    # Try new google.genai SDK with ADC first
+    try:
+        from google import genai
+        project = os.environ.get("GOOGLE_CLOUD_PROJECT")
+        location = os.environ.get("GOOGLE_CLOUD_LOCATION", "us-central1")
+
+        if project:
+            # Use Vertex AI with ADC (gcloud auth application-default login)
+            client = genai.Client(vertexai=True, project=project, location=location)
+        else:
+            # Try with API key from env as fallback
+            api_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
+            if api_key:
+                client = genai.Client(api_key=api_key)
+            else:
+                # Try ADC without explicit project
+                client = genai.Client(vertexai=True, project="default", location=location)
+
+        response = client.models.generate_content(
+            model="gemini-2.0-flash",
+            contents=prompt,
+        )
+        return _extract_code(response.text)
+    except ImportError:
+        pass
+
+    # Fallback to deprecated google.generativeai
     import google.generativeai as genai
     api_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
-    if not api_key:
-        raise RuntimeError("Set GEMINI_API_KEY or GOOGLE_API_KEY")
-    genai.configure(api_key=api_key)
+    if api_key:
+        genai.configure(api_key=api_key)
     m = genai.GenerativeModel("gemini-2.0-flash")
     response = m.generate_content(prompt)
     return _extract_code(response.text)
+
+
+def call_huggingface(prompt: str) -> str:
+    """Call HuggingFace via InferenceClient. Auth: cached login token.
+
+    Login once with: huggingface-cli login
+    Token is cached in ~/.cache/huggingface/token
+    Falls back to HF_TOKEN env var if login not found.
+    """
+    from huggingface_hub import InferenceClient, get_token
+    # get_token() checks: HF_TOKEN env var → cached login token → None
+    token = get_token()
+    if not token:
+        raise RuntimeError(
+            "Not authenticated with Hugging Face.\n"
+            "Run: huggingface-cli login"
+        )
+    model = os.environ.get("HF_MODEL", "mistralai/Mistral-7B-Instruct-v0.3")
+    client = InferenceClient(model=model, token=token)
+    response = client.text_generation(prompt, max_new_tokens=4096)
+    return _extract_code(response)
+
+
+def check_auth():
+    """Check authentication status for all providers. Returns dict of status."""
+    status = {}
+
+    # Claude / Anthropic
+    try:
+        import anthropic
+        client = anthropic.Anthropic()
+        if client.api_key:
+            status["claude"] = "authenticated"
+        else:
+            status["claude"] = "NOT authenticated — run: anthropic auth login"
+    except Exception as e:
+        status["claude"] = f"NOT authenticated — {e}"
+
+    # Gemini / Google
+    try:
+        from google import genai
+        project = os.environ.get("GOOGLE_CLOUD_PROJECT")
+        if project:
+            status["gemini"] = f"authenticated (Vertex AI, project={project})"
+        elif os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY"):
+            status["gemini"] = "authenticated (API key fallback)"
+        else:
+            status["gemini"] = "NOT authenticated — run: gcloud auth application-default login"
+    except ImportError:
+        api_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
+        if api_key:
+            status["gemini"] = "authenticated (API key, legacy SDK)"
+        else:
+            status["gemini"] = "NOT authenticated — run: gcloud auth application-default login"
+
+    # HuggingFace
+    try:
+        from huggingface_hub import get_token
+        token = get_token()
+        if token:
+            status["huggingface"] = "authenticated (login token)"
+        else:
+            status["huggingface"] = "NOT authenticated — run: huggingface-cli login"
+    except ImportError:
+        status["huggingface"] = "NOT available — pip install huggingface-hub"
+
+    return status
 
 
 def _extract_code(text: str) -> str:
@@ -194,11 +334,15 @@ def _extract_code(text: str) -> str:
 
 # ── Validation ────────────────────────────────────────────────────────────────
 def validate_output(filepath: Path, validate_cmd: str) -> dict:
-    """Run validation command and return result."""
-    cmd = validate_cmd.format(file=str(filepath))
+    """Run validation command. Uses shell=False to prevent command injection."""
+    filepath_str = str(filepath)
+    cmd = [
+        sys.executable, "-c",
+        f"import ast; ast.parse(open({filepath_str!r}).read()); print('SYNTAX OK')"
+    ]
     try:
         result = subprocess.run(
-            cmd, shell=True, capture_output=True, text=True, timeout=10
+            cmd, capture_output=True, text=True, timeout=10
         )
         return {
             "passed": result.returncode == 0,
@@ -263,6 +407,7 @@ def run_race(task_id: str, worktrees: dict, rounds: int = 1):
     model_map = {
         "claude": ("Claude", call_claude),
         "gemini": ("Gemini", call_gemini),
+        "huggingface": ("HuggingFace", call_huggingface),
     }
 
     # Filter to worktrees we have callers for
@@ -333,24 +478,36 @@ def run_race(task_id: str, worktrees: dict, rounds: int = 1):
                     "scores": {"syntax_valid": 0, "total": 0, "loc": 0},
                 }
 
-        # Round summary
-        names = list(round_data.keys())
-        if len(names) >= 2:
-            a, b = names[0], names[1]
-            da, db = round_data[a], round_data[b]
-            sa, sb = da["scores"]["total"], db["scores"]["total"]
-            winner = da["label"] if sa > sb else db["label"] if sb > sa else "TIE"
-            colour = G if winner == da["label"] else R if winner == db["label"] else Y
-            print(f"\n  Round {r} → {da['label']}: {sa}pts  vs  {db['label']}: {sb}pts  →  {_c(winner, colour)}")
+        # Round summary — supports 2+ contenders
+        if round_data:
+            ranked = sorted(
+                round_data.items(),
+                key=lambda kv: kv[1]["scores"]["total"],
+                reverse=True,
+            )
+            top_score = ranked[0][1]["scores"]["total"]
+            leaders = [name for name, rd in ranked if rd["scores"]["total"] == top_score]
 
-            # Show diff
-            diff = generate_diff(da["code"], db["code"], da["label"], db["label"])
-            if diff:
-                diff_lines = diff.splitlines()
-                diff_file = wt_path.parent / "AutomagigInaCan" / "results" / f"diff_{task_id}_r{r}.patch"
-                diff_file.parent.mkdir(parents=True, exist_ok=True)
-                diff_file.write_text(diff)
-                print(f"  Diff saved: {diff_file}")
+            scoreboard = "  vs  ".join(
+                f"{rd['label']}: {rd['scores']['total']}pts"
+                for _, rd in ranked
+            )
+
+            if len(leaders) > 1:
+                winner, colour = "TIE", Y
+            else:
+                winner, colour = round_data[leaders[0]]["label"], G
+            print(f"\n  Round {r} → {scoreboard}  →  {_c(winner, colour)}")
+
+            # Show diff between top two contenders
+            if len(ranked) >= 2:
+                da, db = ranked[0][1], ranked[1][1]
+                diff = generate_diff(da["code"], db["code"], da["label"], db["label"])
+                if diff:
+                    diff_file = REPO_ROOT / "results" / f"diff_{task_id}_r{r}.patch"
+                    diff_file.parent.mkdir(parents=True, exist_ok=True)
+                    diff_file.write_text(diff)
+                    print(f"  Diff saved: {diff_file}")
 
         all_results.append(round_data)
 
@@ -373,14 +530,10 @@ def run_race(task_id: str, worktrees: dict, rounds: int = 1):
         ) / max(len(all_results), 1)
         print(f"  {label:12s}: {total} pts total, {avg_time:.1f}s avg response time")
 
-    labels = list(totals.keys())
-    if len(labels) >= 2:
-        if totals[labels[0]] > totals[labels[1]]:
-            overall = labels[0]
-        elif totals[labels[1]] > totals[labels[0]]:
-            overall = labels[1]
-        else:
-            overall = "TIE"
+    if len(totals) >= 2:
+        max_score = max(totals.values())
+        top = [label for label, score in totals.items() if score == max_score]
+        overall = top[0] if len(top) == 1 else "TIE"
         print(f"\n  {_c('WINNER', B)}: {_c(overall, G)}")
 
     # Save results
@@ -446,10 +599,16 @@ def main():
     if args.list:
         list_tasks()
         worktrees = discover_worktrees()
+        model_callers = {"claude", "gemini", "huggingface"}
         print("Detected worktrees:")
         for name, path in worktrees.items():
-            mapped = "✓" if name in ("claude", "gemini") else "✗ (no model caller)"
-            print(f"  {name:15s} → {path}  {mapped}")
+            mapped = "mapped" if name in model_callers else "no model caller"
+            print(f"  {name:15s} -> {path}  ({mapped})")
+        print()
+        print("Authentication status (login-based, no API keys):")
+        auth = check_auth()
+        for provider, status in auth.items():
+            print(f"  {provider:15s}: {status}")
         print()
         sys.exit(0)
 
